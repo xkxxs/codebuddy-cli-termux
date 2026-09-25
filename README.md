@@ -19,6 +19,16 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/xkxxs/codebuddy-cli-termux/main/install.sh)
 ```
 
+国内网络拉不动 `raw.githubusercontent.com` 时,改用镜像:
+
+```bash
+# jsDelivr CDN
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/xkxxs/codebuddy-cli-termux@main/install.sh)
+
+# 或 gh-proxy
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/codebuddy-cli-termux/main/install.sh)
+```
+
 ## 脚本做了什么
 
 | 步骤 | 说明 |
