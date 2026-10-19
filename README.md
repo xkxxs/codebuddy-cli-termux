@@ -39,7 +39,7 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 依赖安装 | `nodejs-lts`、`python`、`make`、`clang`(按需) |
 | 安装 CodeBuddy | `npm install -g @tencent-ai/codebuddy-code`(官方包,无平台限制)。这一步要下载 + 编译 node-pty,耗时数十秒且原本**全程无输出**,现在会显示转圈与已耗时 |
 | **修复 1: shebang** | bin 脚本 `#!/usr/bin/env …` → Termux 绝对路径(否则 `bad interpreter` 无法启动) |
-| **修复 2: node-pty** | 从 `microsoft/node-pty` 源码 `node-gyp` 编译 bionic 版,组装成 `@lydell/node-pty-android-arm64` 放入包内(官方只有 glibc 预编译,`dlopen` 必挂;编译产物带本地缓存,二次秒回) |
+| **修复 2: node-pty** | 从 `microsoft/node-pty` 源码 `node-gyp` 编译 bionic 版,组装成 `@lydell/node-pty-android-arm64` 放入包内(官方只有 glibc 预编译,`dlopen` 必挂)。**只在必要时才真编译**,见下节 |
 | **修复 3: 关闭内置更新器** | `DISABLE_AUTOUPDATER=1`(内置 updater 会尝试 native install,Termux 不可用) |
 | 生成 wrapper | `~/.local/bin/codebuddy`(优先于 npm 原始 bin):启动前检查更新,更新后自动重跑 shebang + node-pty 修复再启动 |
 | 验证 | 版本 / shebang / node-pty 三项检查 |
@@ -100,7 +100,35 @@ CodeBuddy 依赖 `@lydell/node-pty` 获得终端/shell 工具能力。两层问�
 | npm 安装 | `@lydell/node-pty-linux-arm64` 声明 `os: linux`,在 `android` 上被拒;且 loader 按 `process.platform` 找的是 **`@lydell/node-pty-android-arm64`**(官方不存在) |
 | 动态链接 | 预编译 `pty.node` 依赖 glibc(`ld-linux-aarch64.so.1` 等),bionic `dlopen` 报 `libutil.so.1 not found` |
 
-解决:下载 `microsoft/node-pty` 源码,用 Termux 自带 `node-gyp`/`clang` 编译出 bionic 版,配上 lydell 的 JS 层,组装成 `@lydell/node-pty-android-arm64`。编译产物缓存在 `~/.cache/codebuddy-pty-rebuild/`,同版本二次安装直接解压。
+解决:下载 `microsoft/node-pty` 源码,用 Termux 自带 `node-gyp`/`clang` 编译出 bionic 版,配上 lydell 的 JS 层,组装成 `@lydell/node-pty-android-arm64`。
+
+#### 什么时候会真的编译
+
+`npm install -g` 会清掉手工放入的 `@lydell/node-pty-android-arm64`,所以每次装/更新后都得"补回"。但**补回不等于重编译**,按代价从低到高:
+
+| 情况 | 行为 | 实测耗时 |
+|---|---|---|
+| 版本号一致且产物完好 | 直接跳过 | **0.8 秒** |
+| 产物被清掉 / lydell 版本变了,缓存里有对应版本 | 解压 `~/.cache/codebuddy-pty-rebuild/` | **0.8 秒** |
+| 缓存里没有该版本 | 才真正 `npm pack` 源码 + `node-gyp` 编译 | **40 秒** |
+
+缓存文件名带两个版本:`android-arm64-<lydell 版本>-src<node-pty 源码版本>.tar.gz`。
+真正的编译只在首次安装、或 codebuddy 升级换了 lydell 版本时发生。
+
+> 历史坑: wrapper 更新后原本调用 `codebuddy-pty-rebuild --force`,而 `--force`
+> 会同时跳过"就绪检查"和"缓存命中"两个分支,导致**每次更新都白等 40 秒重编译**。
+> 现在更新走不带 `--force` 的路径;`--force` 只在显式 `install.sh --update` 时使用。
+
+#### 版本号从哪来
+
+| 部件 | 版本 | 来源 |
+|---|---|---|
+| `pty.node`(C++ 编译产物) | `node-pty` **1.1.0** | 脚本里钉死 (`NODE_PTY_SRC_VER`),不自动跟最新 |
+| `lib/*.js`(JS 层) | `@lydell/node-pty` 当前版本 | 从 codebuddy 已装的包读出,会随其升级变化 |
+
+两条线目前兼容 —— lydell 的 JS 层只用到 `fork` / `open` / `process` / `resize`
+四个原生方法,1.1.0 都有。就绪检查会比对组装时写入 `package.json` 的版本号与
+当前 lydell 版本,不一致就重建,避免"新版 JS 层配旧原生模块"。
 
 无 node-pty 时 CodeBuddy 会降级到 `child_process` 跑 shell(功能可用但体验差),所以重建失败只警告不阻塞启动。
 

@@ -384,7 +384,11 @@ pty_ok() {
     node -e "require('$PTY_LOADER')" 2>/dev/null
 }
 
-if [ "$FORCE" != 1 ] && pty_ok; then
+# 注意: 光靠 pty_ok 不够 —— 若 codebuddy 升级后 lydell JS 层换了版本, 而
+# npm 又没把旧的 pty.node 清掉, 它依然"能加载", 于是被误判成已就绪, 结果
+# 新版 JS 层配旧原生模块。所以还要比对组装时写进 package.json 的版本号。
+PTY_BUILT_VER=$(node -p "require('$PTY_DEST/package.json').version" 2>/dev/null || echo "")
+if [ "$FORCE" != 1 ] && [ "$PTY_BUILT_VER" = "$LYDELL_VER" ] && pty_ok; then
     ok "node-pty 已就绪 (lydell $LYDELL_VER), 无需重建 (--force 可强制)"
     exit 0
 fi
@@ -461,14 +465,19 @@ PTY_REBUILD_EOF
 run_pty_rebuild() {
     local extra="${1:-}"
     local rc=0
+    # 提示语不写"编译" —— 多数情况下它只是跳过或从缓存恢复, 0.1 秒的事,
+    # 只有缓存里没有对应版本才会真编译 (那时脚本自己会打印"下载源码/编译")
     if [ "$extra" = "force" ]; then
-        run_with_spinner "重建 node-pty 原生模块 (编译, 需数十秒)" "$PTY_REBUILD" --force || rc=$?
+        run_with_spinner "处理 node-pty 原生模块" "$PTY_REBUILD" --force || rc=$?
     else
-        run_with_spinner "重建 node-pty 原生模块 (编译, 需数十秒)" "$PTY_REBUILD" || rc=$?
+        run_with_spinner "处理 node-pty 原生模块" "$PTY_REBUILD" || rc=$?
     fi
+    # 重建脚本的提示值得看: 是"无需重建"、"已从缓存恢复"还是真编译了
     if [ "$rc" -ne 0 ]; then
         printf '%s\n' "$SPIN_OUT" | head -20
         warn "node-pty 重建失败 (shell 工具可能降级, 可手动: codebuddy-pty-rebuild)"
+    else
+        printf '%s\n' "$SPIN_OUT"
     fi
 }
 
@@ -527,10 +536,18 @@ fix_shebangs() {
     return 0
 }
 
-# npm update 会清掉手工放入的 node-pty-android-arm64 → 更新后重建
+# npm update 会清掉手工放入的 node-pty-android-arm64 → 更新后补回。
+#
+# 这里**不能用 --force**: 它会同时跳过"就绪检查"和"缓存命中"两个分支,
+# 于是每次 codebuddy 更新都要重新 npm pack 源码 + node-gyp 编译一遍
+# (数十秒, 且毫无必要 —— node-pty 源码版本是钉死的)。
+# 不带 --force 时的行为:
+#   版本号一致且产物完好 → 零开销跳过
+#   产物缺失/lydell 版本变了 → 命中缓存直接解压恢复 (秒回)
+#   缓存里没有对应版本 → 才真正下载源码编译
 rebuild_pty() {
     if [ -x "$PTY_REBUILD" ]; then
-        "$PTY_REBUILD" --force >/dev/null 2>&1 \
+        "$PTY_REBUILD" >/dev/null 2>&1 \
             || echo "!! node-pty 重建失败 (shell 工具可能降级), 可手动: codebuddy-pty-rebuild" >&2
     fi
 }
