@@ -42,6 +42,29 @@ info() { echo -e "${BLU}▸${NC} $*"; }
 warn() { echo -e "${YEL}⚠${NC} $*"; }
 fail() { echo -e "${RED}✗${NC} $*"; exit 1; }
 
+# 长时间无输出的操作 (npm install -g、node-pty 编译) 会让人以为卡死。
+# 后台跑命令 + 前台转圈显示已耗时; 输出存到 $SPIN_OUT 供调用方判断
+# (codebuddy 需要 grep npm 输出里的 EACCES / ENOTEMPTY, 所以不能丢给 /dev/null)。
+SPIN_OUT=""
+run_with_spinner() {
+    local msg="$1"; shift
+    local log i=0 rc=0
+    local -a chars=('|' '/' '-' '\\')
+    log=$(mktemp "${TMPDIR:-$PREFIX/tmp}/spin.XXXXXX")
+    "$@" >"$log" 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r\033[K  %s %s (%ds)' "$msg" "${chars[$(( i % 4 ))]}" "$(( i / 2 ))"
+        i=$(( i + 1 ))
+        sleep 0.5
+    done
+    wait "$pid" || rc=$?
+    printf '\r\033[K'
+    SPIN_OUT=$(cat "$log" 2>/dev/null)
+    rm -f "$log"
+    return $rc
+}
+
 # ---------- 环境检查 ----------
 check_environment() {
     if [ "$(uname -o 2>/dev/null || true)" != "Android" ] && [ ! -x "$PREFIX/bin/pkg" ]; then
@@ -52,6 +75,144 @@ check_environment() {
     info "环境检查通过 (Termux aarch64)"
 }
 
+# ---------- 镜像源适配 ----------
+# 刚装的 Termux 默认官方源, 国内经常慢/不可达。本函数对候选源逐个探测 + 测速,
+# 再按"新鲜度优先、速度兜底"选一个自动切换 (幂等; 切换后 apt update 失败会回滚)。
+#
+# 排序规则 —— 每一条都是实测踩出来的:
+#   1) 可用性: HTTP 200 **且 Release 里能解析出 Date: 字段**
+#      华为云是反例: /termux/... 路径下 Release 与 Packages 都返回 200, 内容却是
+#      一个 12KB 的 HTML 页面。只校验状态码的话它会被算进候选。
+#   2) 绝对陈旧: Release 日期距今超过 MIRROR_MAX_AGE 的直接判废。
+#      腾讯云实测停留在 4 个月前 (2831 包 vs 官方 3009 包, python 3.13 vs 3.14)。
+#   3) 新鲜度优先: Release 日期落后"最新的那个候选"超过 MIRROR_FRESH_GRACE 就不要。
+#      实测 2026-10-19 —— 快慢和新鲜度并不一致:
+#        官方/清华      python 3.14.8   nodejs 26.4.0-1   patchelf 0.19.2
+#        中科大/阿里云  python 3.14.6-1 (其余同上)
+#        腾讯云         python 3.13.13  nodejs 26.3.1    patchelf 0.19.0
+#      只看速度很容易切到一个包版本偏旧的源。
+#   4) 落在宽限窗口内的多个候选 → 选最快的。
+MIRROR_FRESH_GRACE="${MIRROR_FRESH_GRACE:-43200}"   # 12 小时
+MIRROR_MAX_AGE="${MIRROR_MAX_AGE:-2592000}"         # 30 天
+
+# $1=Release 文件路径 → 输出 Unix 时间戳; 解析不出返回非零
+release_ts() {
+    local d
+    d=$(awk -F': ' '/^Date: /{print $2; exit}' "$1" 2>/dev/null) || d=""
+    [ -n "$d" ] || return 1
+    date -d "$d" +%s 2>/dev/null || return 1
+}
+
+fix_mirror() {
+    local sources_file="$PREFIX/etc/apt/sources.list"
+    [ -f "$sources_file" ] || { warn "未找到 apt 源文件, 跳过镜像适配"; return; }
+
+    # 候选: "显示名 base URL" (路径各不相同, 已逐个实测 HTTP 200)
+    local candidates=(
+        "官方 https://packages.termux.dev/apt/termux-main"
+        "清华 https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main"
+        "中科大 https://mirrors.ustc.edu.cn/termux/apt/termux-main"
+        "阿里云 https://mirrors.aliyun.com/termux/termux-main"
+        "北大 https://mirrors.pku.edu.cn/termux/termux-main"
+        "南科大 https://mirrors.sustech.edu.cn/termux/apt/termux-main"
+    )
+
+    local work entry name url code ts age t1 t2 t i cut
+    work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/mirror.XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" RETURN
+
+    local now n=0 newest=0
+    local -a NAMES=() URLS=() TIMES=() STAMPS=()
+    now=$(date +%s)
+
+    for entry in "${candidates[@]}"; do
+        name="${entry%% *}"
+        url="${entry##* }"
+        code=$(curl -s -o "$work/rel" -w '%{http_code}' \
+            --connect-timeout 5 --max-time 15 "$url/dists/stable/Release" 2>/dev/null) || code=000
+        if [ "$code" != "200" ]; then
+            info "跳过 $name (Release HTTP $code)"
+            continue
+        fi
+        # 关键在于必须解析得出 Date —— 挡掉返回 HTML 却给 200 的假源
+        ts=$(release_ts "$work/rel") || {
+            info "跳过 $name (Release 里没有 Date 字段 —— 多半是个返回网页的假源)"
+            continue
+        }
+        age=$(( now - ts ))
+        if [ "$age" -gt "$MIRROR_MAX_AGE" ]; then
+            info "跳过 $name (同步于 $(( age / 86400 )) 天前, 太陈旧)"
+            continue
+        fi
+        t1=$(curl -s -o /dev/null -w '%{time_total}' \
+            --connect-timeout 5 --max-time 15 "$url/dists/stable/Release" 2>/dev/null) || t1=999
+        t2=$(curl -s -o /dev/null -w '%{time_total}' \
+            --connect-timeout 5 --max-time 15 "$url/dists/stable/Release" 2>/dev/null) || t2=999
+        t=$(printf '%s\n%s\n' "$t1" "$t2" | sort -n | head -1)
+        info "候选 $name: ${t}s, 同步于 $(( age / 3600 )) 小时前"
+        [ "$ts" -gt "$newest" ] && newest=$ts
+        NAMES+=("$name"); URLS+=("$url"); TIMES+=("$t"); STAMPS+=("$ts")
+        n=$(( n + 1 ))
+    done
+
+    if [ "$n" -eq 0 ]; then
+        warn "所有候选源都不可用, 保持当前配置 (可手动: pkg change-repo)"
+        return
+    fi
+
+    # 只保留"新鲜度落在宽限窗口内"的, 再从中选最快的
+    local best_name="" best_url="" best_t=999999 best_ts=0
+    cut=$(( newest - MIRROR_FRESH_GRACE ))
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ "${STAMPS[$i]}" -ge "$cut" ]; then
+            t="${TIMES[$i]}"
+            if [ -z "$best_url" ] || awk "BEGIN{exit !($t < $best_t)}"; then
+                best_name="${NAMES[$i]}"; best_url="${URLS[$i]}"; best_t="$t"; best_ts="${STAMPS[$i]}"
+            fi
+        fi
+        i=$(( i + 1 ))
+    done
+
+    if [ -z "$best_url" ]; then
+        warn "候选源的同步时间都超出宽限窗口, 保持当前配置"
+        return
+    fi
+    ok "选定源: $best_name (${best_t}s, 同步于 $(( (now - best_ts) / 3600 )) 小时前)"
+
+    # 当前已是选定源 → 不动
+    if grep -qF "$best_url" "$sources_file" 2>/dev/null; then
+        ok "当前源已是选定源, 无需切换"
+        return
+    fi
+
+    local backup="$sources_file.bak.$(date +%s)"
+    cp "$sources_file" "$backup"
+    warn "切换源: $(grep -oE 'https://[^ ]+' "$sources_file" | head -1) → $best_name"
+    {
+        echo "# 由 install.sh 自动切换 (选定: $best_name ${best_t}s, Release $(( (now - best_ts) / 3600 )) 小时前)"
+        echo "deb $best_url stable main"
+    } > "$sources_file"
+
+    if DEBIAN_FRONTEND=noninteractive apt update -y >/dev/null 2>&1; then
+        ok "apt update 成功 ($best_name), 原配置备份: $(basename "$backup")"
+    else
+        warn "apt update 失败, 已自动回滚到原配置"
+        cp "$backup" "$sources_file"
+        DEBIAN_FRONTEND=noninteractive apt update -y >/dev/null 2>&1 || true
+    fi
+}
+
+upgrade_packages() {
+    info "更新软件包索引并升级全部软件包…"
+    info "提示: 全新 Termux 首次升级可能耗时数分钟 (下载量大), 请耐心等待, 不要打断"
+    if DEBIAN_FRONTEND=noninteractive pkg upgrade -y; then
+        ok "软件包已是最新"
+    else
+        warn "pkg upgrade 未完全成功, 请稍后重试 (pkg upgrade -y)"
+    fi
+}
 # ---------- 依赖 ----------
 # nodejs-lts: node+npm; python/make/clang: node-gyp 编译 node-pty 原生模块
 install_dependencies() {
@@ -115,12 +276,16 @@ npm_install_fresh() {
     # 预清理: 去掉 npm 不认识的注入目录, 让替换能顺利完成
     rm -rf "${PKG_DIR}/node_modules/@lydell/node-pty-android-arm64" 2>/dev/null || true
 
-    npm_out=$(npm install -g "${NPM_PKG}@latest" 2>&1) || rc=$?
+    run_with_spinner "npm install -g ${NPM_PKG}@latest (较慢, 需下载并编译 node-pty)" \
+        npm install -g "${NPM_PKG}@latest" || rc=$?
+    npm_out="$SPIN_OUT"
     if [ "$rc" -ne 0 ] && printf '%s' "$npm_out" | grep -q 'EACCES'; then
         [ "$mode" = "full" ] && warn "npm 报 EACCES, 修复 SELinux context 后重试…"
         fix_selinux_context
         rc=0
-        npm_out=$(npm install -g "${NPM_PKG}@latest" 2>&1) || rc=$?
+        run_with_spinner "重试 npm install -g ${NPM_PKG}@latest" \
+            npm install -g "${NPM_PKG}@latest" || rc=$?
+        npm_out="$SPIN_OUT"
     fi
     if [ "$rc" -ne 0 ] && printf '%s' "$npm_out" | grep -qE 'ENOTEMPTY|EEXIST'; then
         [ "$mode" = "full" ] && warn "npm 目录残留 (ENOTEMPTY), 卸载后强删重装…"
@@ -295,10 +460,15 @@ PTY_REBUILD_EOF
 
 run_pty_rebuild() {
     local extra="${1:-}"
+    local rc=0
     if [ "$extra" = "force" ]; then
-        "$PTY_REBUILD" --force || warn "node-pty 重建失败 (shell 工具可能降级, 可手动: codebuddy-pty-rebuild)"
+        run_with_spinner "重建 node-pty 原生模块 (编译, 需数十秒)" "$PTY_REBUILD" --force || rc=$?
     else
-        "$PTY_REBUILD" || warn "node-pty 重建失败 (shell 工具可能降级, 可手动: codebuddy-pty-rebuild)"
+        run_with_spinner "重建 node-pty 原生模块 (编译, 需数十秒)" "$PTY_REBUILD" || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        printf '%s\n' "$SPIN_OUT" | head -20
+        warn "node-pty 重建失败 (shell 工具可能降级, 可手动: codebuddy-pty-rebuild)"
     fi
 }
 
@@ -521,6 +691,8 @@ esac
 
 info "codebuddy-cli-termux 安装脚本 — 仅支持 Termux aarch64"
 check_environment
+fix_mirror
+upgrade_packages
 install_dependencies
 
 if [ "$FORCE_UPDATE" = 1 ]; then

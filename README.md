@@ -34,8 +34,10 @@ bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/xkxxs/c
 | 步骤 | 说明 |
 |---|---|
 | 环境检查 | 仅支持 Termux + aarch64 |
+| 镜像源适配 | 对 官方/清华/中科大/阿里云/北大/南科大 逐个探测 + 测速,按**新鲜度优先、速度兜底**选源(幂等)。Release 落后最新超过 12 小时的源会被跳过 —— 快的源不一定同步得勤(实测腾讯云曾落后 4 个月、包数差 178 个)。切换前自动备份,切换后 `apt update` 失败会回滚 |
+| 软件包升级 | `pkg upgrade -y`(全新 Termux 首次可能数分钟) |
 | 依赖安装 | `nodejs-lts`、`python`、`make`、`clang`(按需) |
-| 安装 CodeBuddy | `npm install -g @tencent-ai/codebuddy-code`(官方包,无平台限制) |
+| 安装 CodeBuddy | `npm install -g @tencent-ai/codebuddy-code`(官方包,无平台限制)。这一步要下载 + 编译 node-pty,耗时数十秒且原本**全程无输出**,现在会显示转圈与已耗时 |
 | **修复 1: shebang** | bin 脚本 `#!/usr/bin/env …` → Termux 绝对路径(否则 `bad interpreter` 无法启动) |
 | **修复 2: node-pty** | 从 `microsoft/node-pty` 源码 `node-gyp` 编译 bionic 版,组装成 `@lydell/node-pty-android-arm64` 放入包内(官方只有 glibc 预编译,`dlopen` 必挂;编译产物带本地缓存,二次秒回) |
 | **修复 3: 关闭内置更新器** | `DISABLE_AUTOUPDATER=1`(内置 updater 会尝试 native install,Termux 不可用) |
