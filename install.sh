@@ -685,6 +685,11 @@ show_guide() {
     echo
     echo "  3. 重跑本脚本即重装/修复 (幂等); --uninstall 卸载"
     echo
+    echo "  建议的 Android 设置 (防止 Termux 被系统杀后台):"
+    echo "    1. 开发者选项 → 停止限制子进程: 开启"
+    echo "    2. 系统设置 → 应用 → Termux → 电池: 不优化"
+    echo "    3. 后台活动 / 自启动: 设为无限制"
+    echo
     echo "  注意: 请勿运行 codebuddy install (native 安装在 Termux 不可用)"
     echo "=============================================================="
     echo
